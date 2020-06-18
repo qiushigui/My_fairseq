@@ -15,4 +15,7 @@ Fairseq(-py) is a sequence modeling toolkit that allows researchers and
 developers to train custom models for translation, summarization, language
 modeling and other text generation tasks.
 
-Token DROP
+## Token DROP
+LDC ：47.4
+代码有bug：目标端那里shape不对，但是修复之后还不如之前，玄学
+
