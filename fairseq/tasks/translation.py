@@ -156,6 +156,8 @@ class TranslationTask(FairseqTask):
     def add_args(parser):
         """Add task-specific arguments to the parser."""
         # fmt: off
+
+        parser.add_argument('--mask',help='Null', action='store_true')
         parser.add_argument('data', help='colon separated path to data directories list, \
                             will be iterated upon during epochs in round-robin manner')
         parser.add_argument('-s', '--source-lang', default=None, metavar='SRC',
@@ -229,7 +231,8 @@ class TranslationTask(FairseqTask):
         assert src_dict.unk() == tgt_dict.unk()
         logger.info('[{}] dictionary: {} types'.format(args.source_lang, len(src_dict)))
         logger.info('[{}] dictionary: {} types'.format(args.target_lang, len(tgt_dict)))
-
+        src_dict.add_symbol('<mask>')
+        tgt_dict.add_symbol('<mask>')
         return cls(args, src_dict, tgt_dict)
 
     def load_dataset(self, split, epoch=1, combine=False, **kwargs):
@@ -261,7 +264,6 @@ class TranslationTask(FairseqTask):
         return LanguagePairDataset(src_tokens, src_lengths, self.source_dictionary)
 
     def build_model(self, args):
-        model = super().build_model(args)
         if getattr(args, 'eval_bleu', False):
             assert getattr(args, 'eval_bleu_detok', None) is not None, (
                 '--eval-bleu-detok is required if using --eval-bleu; '
@@ -275,8 +277,8 @@ class TranslationTask(FairseqTask):
             ))
 
             gen_args = json.loads(getattr(args, 'eval_bleu_args', '{}') or '{}')
-            self.sequence_generator = self.build_generator([model], Namespace(**gen_args))
-        return model
+            self.sequence_generator = self.build_generator(Namespace(**gen_args))
+        return super().build_model(args)
 
     def valid_step(self, sample, model, criterion):
         loss, sample_size, logging_output = super().valid_step(sample, model, criterion)
@@ -369,6 +371,7 @@ class TranslationTask(FairseqTask):
             logger.info('example hypothesis: ' + hyps[0])
             logger.info('example reference: ' + refs[0])
         if self.args.eval_tokenized_bleu:
-            return sacrebleu.corpus_bleu(hyps, [refs], tokenize='none')
+            return sacrebleu.corpus_bleu(hyps,[refs],tokenize=tokenize)
         else:
-            return sacrebleu.corpus_bleu(hyps, [refs])
+            return sacrebleu.corpus_bleu(hyps,[refs])
+        return sacrebleu.corpus_bleu(hyps, [refs], tokenize=tokenize)

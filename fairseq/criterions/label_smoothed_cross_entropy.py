@@ -4,7 +4,6 @@
 # LICENSE file in the root directory of this source tree.
 
 import math
-
 from fairseq import metrics, utils
 from fairseq.criterions import FairseqCriterion, register_criterion
 
@@ -63,6 +62,9 @@ class LabelSmoothedCrossEntropyCriterion(FairseqCriterion):
             'nsentences': sample['target'].size(0),
             'sample_size': sample_size,
         }
+        if self.training:
+            adv_loss = net_output[1]['adv_loss']
+            loss = loss + adv_loss
         return loss, sample_size, logging_output
 
     def compute_loss(self, model, net_output, sample, reduce=True):

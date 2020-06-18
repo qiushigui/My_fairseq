@@ -10,18 +10,8 @@ from typing import Dict, Optional
 
 try:
     import torch
-
-    def type_as(a, b):
-        if torch.is_tensor(a) and torch.is_tensor(b):
-            return a.to(b)
-        else:
-            return a
 except ImportError:
     torch = None
-
-    def type_as(a, b):
-        return a
-
 
 try:
     import numpy as np
@@ -77,8 +67,8 @@ class AverageMeter(Meter):
         if val is not None:
             self.val = val
             if n > 0:
-                self.sum = type_as(self.sum, val) + (val * n)
-                self.count = type_as(self.count, n) + n
+                self.sum += val * n
+                self.count += n
 
     def state_dict(self):
         return {
@@ -125,7 +115,7 @@ class TimeMeter(Meter):
         self.i = 0
 
     def update(self, val=1):
-        self.n = type_as(self.n, val) + val
+        self.n += val
         self.i += 1
 
     def state_dict(self):
@@ -171,13 +161,11 @@ class StopwatchMeter(Meter):
     def start(self):
         self.start_time = time.perf_counter()
 
-    def stop(self, n=1, prehook=None):
+    def stop(self, n=1):
         if self.start_time is not None:
-            if prehook is not None:
-                prehook()
             delta = time.perf_counter() - self.start_time
-            self.sum = self.sum + delta
-            self.n = type_as(self.n, n) + n
+            self.sum += delta
+            self.n += n
 
     def reset(self):
         self.sum = 0  # cumulative time during which stopwatch was active

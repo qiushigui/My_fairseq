@@ -26,13 +26,11 @@ from fairseq.modules import (
     TransformerDecoderLayer,
     TransformerEncoderLayer,
 )
-from fairseq.modules.quant_noise import quant_noise as apply_quant_noise_
 from torch import Tensor
 
 
 DEFAULT_MAX_SOURCE_POSITIONS = 1024
 DEFAULT_MAX_TARGET_POSITIONS = 1024
-
 
 @register_model("transformer")
 class TransformerModel(FairseqEncoderDecoderModel):
@@ -89,11 +87,20 @@ class TransformerModel(FairseqEncoderDecoderModel):
         super().__init__(encoder, decoder)
         self.args = args
         self.supports_align_args = True
+        self.adv_hidden = torch.randn(encoder.embed_tokens.embedding_dim, 2, device='cuda').half()
+        self.adv_hidden_d = torch.randn(decoder.embed_tokens.embedding_dim, 2, device='cuda').half()
+        self.adv_bias = nn.Parameter(torch.zeros(2,device='cuda')).half()
+        self.adv_bias_d = nn.Parameter(torch.zeros(2,device='cuda')).half()
+
 
     @staticmethod
     def add_args(parser):
         """Add model-specific arguments to the parser."""
         # fmt: off
+        parser.add_argument('--src-drop', type=float, metavar='D', default=0.0,
+                            help='dropout probability')
+        parser.add_argument('--tgt-drop', type=float, metavar='D', default=0.0,
+                            help='dropout probability')
         parser.add_argument('--activation-fn',
                             choices=utils.get_available_activation_fns(),
                             help='activation function to use')
@@ -143,10 +150,6 @@ class TransformerModel(FairseqEncoderDecoderModel):
                                  'Must be used with adaptive_loss criterion'),
         parser.add_argument('--adaptive-softmax-dropout', type=float, metavar='D',
                             help='sets adaptive softmax dropout for the tail projections')
-        parser.add_argument('--layernorm-embedding', action='store_true',
-                            help='add layernorm to embedding')
-        parser.add_argument('--no-scale-embedding', action='store_true',
-                            help='if True, dont scale embeddings')
         # args for "Cross+Self-Attention for Transformer Models" (Peitz et al., 2019)
         parser.add_argument('--no-cross-attention', default=False, action='store_true',
                             help='do not perform cross-attention')
@@ -163,13 +166,10 @@ class TransformerModel(FairseqEncoderDecoderModel):
                             help='which layers to *keep* when pruning as a comma-separated list')
         parser.add_argument('--decoder-layers-to-keep', default=None,
                             help='which layers to *keep* when pruning as a comma-separated list')
-        # args for Training with Quantization Noise for Extreme Model Compression ({Fan*, Stock*} et al., 2020)
-        parser.add_argument('--quant-noise-pq', type=float, metavar='D', default=0,
-                            help='iterative PQ quantization noise at training time')
-        parser.add_argument('--quant-noise-pq-block-size', type=int, metavar='D', default=8,
-                            help='block size of quantization noise at training time')
-        parser.add_argument('--quant-noise-scalar', type=float, metavar='D', default=0,
-                            help='scalar quantization noise and scalar quantization at training time')
+        parser.add_argument('--layernorm-embedding', action='store_true',
+                            help='add layernorm to embedding')
+        parser.add_argument('--no-scale-embedding', action='store_true',
+                            help='if True, dont scale embeddings')
         # fmt: on
 
     @classmethod
@@ -191,6 +191,16 @@ class TransformerModel(FairseqEncoderDecoderModel):
 
         src_dict, tgt_dict = task.source_dictionary, task.target_dictionary
 
+        def build_embedding(dictionary, embed_dim, path=None):
+            num_embeddings = len(dictionary)
+            padding_idx = dictionary.pad()
+            emb = Embedding(num_embeddings, embed_dim, padding_idx)
+            # if provided, load from preloaded dictionaries
+            if path:
+                embed_dict = utils.parse_embedding(path)
+                utils.load_embedding(embed_dict, dictionary, emb)
+            return emb
+
         if args.share_all_embeddings:
             if src_dict != tgt_dict:
                 raise ValueError("--share-all-embeddings requires a joined dictionary")
@@ -204,34 +214,22 @@ class TransformerModel(FairseqEncoderDecoderModel):
                 raise ValueError(
                     "--share-all-embeddings not compatible with --decoder-embed-path"
                 )
-            encoder_embed_tokens = cls.build_embedding(
-                args, src_dict, args.encoder_embed_dim, args.encoder_embed_path
+            encoder_embed_tokens = build_embedding(
+                src_dict, args.encoder_embed_dim, args.encoder_embed_path
             )
             decoder_embed_tokens = encoder_embed_tokens
             args.share_decoder_input_output_embed = True
         else:
-            encoder_embed_tokens = cls.build_embedding(
-                args, src_dict, args.encoder_embed_dim, args.encoder_embed_path
+            encoder_embed_tokens = build_embedding(
+                src_dict, args.encoder_embed_dim, args.encoder_embed_path
             )
-            decoder_embed_tokens = cls.build_embedding(
-                args, tgt_dict, args.decoder_embed_dim, args.decoder_embed_path
+            decoder_embed_tokens = build_embedding(
+                tgt_dict, args.decoder_embed_dim, args.decoder_embed_path
             )
 
         encoder = cls.build_encoder(args, src_dict, encoder_embed_tokens)
         decoder = cls.build_decoder(args, tgt_dict, decoder_embed_tokens)
         return cls(args, encoder, decoder)
-
-    @classmethod
-    def build_embedding(cls, args, dictionary, embed_dim, path=None):
-        num_embeddings = len(dictionary)
-        padding_idx = dictionary.pad()
-
-        emb = Embedding(num_embeddings, embed_dim, padding_idx)
-        # if provided, load from preloaded dictionaries
-        if path:
-            embed_dict = utils.parse_embedding(path)
-            utils.load_embedding(embed_dict, dictionary, emb)
-        return emb
 
     @classmethod
     def build_encoder(cls, args, src_dict, embed_tokens):
@@ -271,6 +269,7 @@ class TransformerModel(FairseqEncoderDecoderModel):
             cls_input=cls_input,
             return_all_hiddens=return_all_hiddens,
         )
+        adv_criterion = nn.CrossEntropyLoss()
         decoder_out = self.decoder(
             prev_output_tokens,
             encoder_out=encoder_out,
@@ -280,6 +279,18 @@ class TransformerModel(FairseqEncoderDecoderModel):
             src_lengths=src_lengths,
             return_all_hiddens=return_all_hiddens,
         )
+        if self.training:
+            pad = src_tokens.t().eq(1)
+            self.encoder.adv_targets[pad] = -100
+            pad = prev_output_tokens.t().eq(1)
+            self.decoder.adv_targets[pad] = -100
+            adv_h = torch.matmul(encoder_out.encoder_out, self.adv_hidden) + self.adv_bias
+            adv_loss_enc = adv_criterion(adv_h.view(-1, 2), self.encoder.adv_targets.reshape(-1))
+            adv_h = torch.matmul(self.decoder.hidden, self.adv_hidden_d) + self.adv_bias_d
+            adv_loss_dec = adv_criterion(adv_h.view(-1, 2), self.decoder.adv_targets.reshape(-1))
+            adv_loss = (adv_loss_enc + adv_loss_dec) / 2
+            decoder_out[1]['adv_loss'] = adv_loss
+            import ipdb;ipdb.set_trace()
         return decoder_out
 
     # Since get_normalized_probs is in the Fairseq Model which is not scriptable,
@@ -288,12 +299,14 @@ class TransformerModel(FairseqEncoderDecoderModel):
     @torch.jit.export
     def get_normalized_probs(
         self,
-        net_output: Tuple[Tensor, Optional[Dict[str, List[Optional[Tensor]]]]],
+        net_output: Tuple[Tensor, Dict[str, List[Optional[Tensor]]]],
         log_probs: bool,
         sample: Optional[Dict[str, Tensor]] = None,
     ):
         """Get normalized probabilities (or log probs) from a net's output."""
         return self.get_normalized_probs_scriptable(net_output, log_probs, sample)
+
+
 
 
 @register_model("transformer_align")
@@ -400,20 +413,11 @@ class TransformerEncoder(FairseqEncoder):
             else None
         )
 
-        if not args.adaptive_input and args.quant_noise_pq > 0:
-            self.quant_noise = apply_quant_noise_(
-                nn.Linear(embed_dim, embed_dim, bias=False),
-                args.quant_noise_pq,
-                args.quant_noise_pq_block_size,
-            )
-        else:
-            self.quant_noise = None
-
         self.layer_wise_attention = getattr(args, "layer_wise_attention", False)
 
         self.layers = nn.ModuleList([])
         self.layers.extend(
-            [self.build_encoder_layer(args) for i in range(args.encoder_layers)]
+            [TransformerEncoderLayer(args) for i in range(args.encoder_layers)]
         )
         self.num_layers = len(self.layers)
 
@@ -425,10 +429,8 @@ class TransformerEncoder(FairseqEncoder):
             self.layernorm_embedding = LayerNorm(embed_dim)
         else:
             self.layernorm_embedding = None
-
-    def build_encoder_layer(self, args):
-        return TransformerEncoderLayer(args)
-
+        self.src_drop = args.src_drop
+        self.mask = dictionary.indices['<mask>']
     def forward_embedding(self, src_tokens):
         # embed tokens and positions
         x = embed = self.embed_scale * self.embed_tokens(src_tokens)
@@ -437,8 +439,6 @@ class TransformerEncoder(FairseqEncoder):
         if self.layernorm_embedding is not None:
             x = self.layernorm_embedding(x)
         x = F.dropout(x, p=self.dropout, training=self.training)
-        if self.quant_noise is not None:
-            x = self.quant_noise(x)
         return x, embed
 
     def forward(
@@ -471,9 +471,17 @@ class TransformerEncoder(FairseqEncoder):
         """
         if self.layer_wise_attention:
             return_all_hiddens = True
-
+        if self.training:
+            drop_index = self.mask
+            pad_index = 1
+            DROP_MATRIX = torch.empty(src_tokens.shape, device='cuda').fill_(self.src_drop).bernoulli().long()
+            pad = src_tokens == pad_index
+            DROP_MATRIX[pad] = 0
+            src_tokens = src_tokens * (1 - DROP_MATRIX) + drop_index * DROP_MATRIX
+            self.adv_targets = DROP_MATRIX.t()
         x, encoder_embedding = self.forward_embedding(src_tokens)
-
+        #if not self.training:
+        #    x = x * (1 - self.src_drop)
         # B x T x C -> T x B x C
         x = x.transpose(0, 1)
 
@@ -491,7 +499,6 @@ class TransformerEncoder(FairseqEncoder):
                 if return_all_hiddens:
                     assert encoder_states is not None
                     encoder_states.append(x)
-
         if self.layer_norm is not None:
             x = self.layer_norm(x)
             if return_all_hiddens:
@@ -502,8 +509,6 @@ class TransformerEncoder(FairseqEncoder):
             encoder_padding_mask=encoder_padding_mask,  # B x T
             encoder_embedding=encoder_embedding,  # B x T x C
             encoder_states=encoder_states,  # List[T x B x C]
-            src_tokens=None,
-            src_lengths=None,
         )
 
     @torch.jit.export
@@ -535,13 +540,6 @@ class TransformerEncoder(FairseqEncoder):
             if encoder_out.encoder_embedding is None
             else encoder_out.encoder_embedding.index_select(0, new_order)
         )
-        src_tokens = encoder_out.src_tokens
-        if src_tokens is not None:
-            src_tokens = src_tokens.index_select(0, new_order)
-
-        src_lengths = encoder_out.src_lengths
-        if src_lengths is not None:
-            src_lengths = src_lengths.index_select(0, new_order)
 
         encoder_states = encoder_out.encoder_states
         if encoder_states is not None:
@@ -553,8 +551,6 @@ class TransformerEncoder(FairseqEncoder):
             encoder_padding_mask=new_encoder_out["encoder_padding_mask"],  # B x T
             encoder_embedding=new_encoder_out["encoder_embedding"],  # B x T x C
             encoder_states=encoder_states,  # List[T x B x C]
-            src_tokens=src_tokens,  # B x T
-            src_lengths=src_lengths,  # B x 1
         )
 
     def max_positions(self):
@@ -618,7 +614,6 @@ class TransformerDecoder(FairseqIncrementalDecoder):
     """
 
     def __init__(self, args, dictionary, embed_tokens, no_encoder_attn=False):
-        self.args = args
         super().__init__(dictionary)
         self.register_buffer("version", torch.Tensor([3]))
         self._future_mask = torch.empty(0)
@@ -638,15 +633,6 @@ class TransformerDecoder(FairseqIncrementalDecoder):
         self.embed_tokens = embed_tokens
 
         self.embed_scale = 1.0 if args.no_scale_embedding else math.sqrt(embed_dim)
-
-        if not args.adaptive_input and args.quant_noise_pq > 0:
-            self.quant_noise = apply_quant_noise_(
-                nn.Linear(embed_dim, embed_dim, bias=False),
-                args.quant_noise_pq,
-                args.quant_noise_pq_block_size,
-            )
-        else:
-            self.quant_noise = None
 
         self.project_in_dim = (
             Linear(input_embed_dim, embed_dim, bias=False)
@@ -671,7 +657,7 @@ class TransformerDecoder(FairseqIncrementalDecoder):
         self.layers = nn.ModuleList([])
         self.layers.extend(
             [
-                self.build_decoder_layer(args, no_encoder_attn)
+                TransformerDecoderLayer(args, no_encoder_attn)
                 for _ in range(args.decoder_layers)
             ]
         )
@@ -695,6 +681,11 @@ class TransformerDecoder(FairseqIncrementalDecoder):
                 factor=args.adaptive_softmax_factor,
                 tie_proj=args.tie_adaptive_proj,
             )
+        elif not self.share_input_output_embed:
+            self.embed_out = nn.Parameter(
+                torch.Tensor(len(dictionary), self.output_embed_dim)
+            )
+            nn.init.normal_(self.embed_out, mean=0, std=self.output_embed_dim ** -0.5)
 
         if args.decoder_normalize_before and not getattr(
             args, "no_decoder_final_norm", False
@@ -706,24 +697,8 @@ class TransformerDecoder(FairseqIncrementalDecoder):
             self.layernorm_embedding = LayerNorm(embed_dim)
         else:
             self.layernorm_embedding = None
-
-        if self.share_input_output_embed:
-            self.output_projection = nn.Linear(
-                self.embed_tokens.weight.shape[1],
-                self.embed_tokens.weight.shape[0],
-                bias=False,
-            )
-            self.output_projection.weight = self.embed_tokens.weight
-        else:
-            self.output_projection = nn.Linear(
-                self.output_embed_dim, len(dictionary), bias=False
-            )
-            nn.init.normal_(
-                self.output_projection.weight, mean=0, std=self.output_embed_dim ** -0.5
-            )
-
-    def build_decoder_layer(self, args, no_encoder_attn=False):
-        return TransformerDecoderLayer(args, no_encoder_attn)
+        self.tgt_drop = args.tgt_drop
+        self.mask = dictionary.indices['<mask>']
 
     def forward(
         self,
@@ -759,6 +734,7 @@ class TransformerDecoder(FairseqIncrementalDecoder):
             alignment_layer=alignment_layer,
             alignment_heads=alignment_heads,
         )
+        self.hidden = x
         if not features_only:
             x = self.output_layer(x)
         return x, extra
@@ -791,6 +767,14 @@ class TransformerDecoder(FairseqIncrementalDecoder):
                 - the decoder's features of shape `(batch, tgt_len, embed_dim)`
                 - a dictionary with any model-specific outputs
         """
+        if self.training:
+            drop_index = self.mask
+            pad_index = 1
+            DROP_MATRIX = torch.empty(prev_output_tokens.shape, device='cuda').fill_(self.tgt_drop).bernoulli().long()
+            pad_mask = prev_output_tokens == pad_index
+            DROP_MATRIX[pad_mask] = 0 # dont replace pad token
+            prev_output_tokens = prev_output_tokens * (1 - DROP_MATRIX) + drop_index * DROP_MATRIX
+            self.adv_targets = DROP_MATRIX.t()
         if alignment_layer is None:
             alignment_layer = self.num_layers - 1
 
@@ -810,10 +794,8 @@ class TransformerDecoder(FairseqIncrementalDecoder):
 
         # embed tokens and positions
         x = self.embed_scale * self.embed_tokens(prev_output_tokens)
-
-        if self.quant_noise is not None:
-            x = self.quant_noise(x)
-
+        if not self.training:
+            x = x * (1 - self.tgt_drop)
         if self.project_in_dim is not None:
             x = self.project_in_dim(x)
 
@@ -891,7 +873,10 @@ class TransformerDecoder(FairseqIncrementalDecoder):
         """Project features to the vocabulary size."""
         if self.adaptive_softmax is None:
             # project back to size of vocabulary
-            return self.output_projection(features)
+            if self.share_input_output_embed:
+                return F.linear(features, self.embed_tokens.weight)
+            else:
+                return F.linear(features, self.embed_out)
         else:
             return features
 
@@ -915,6 +900,17 @@ class TransformerDecoder(FairseqIncrementalDecoder):
         self._future_mask = self._future_mask.to(tensor)
         return self._future_mask[:dim, :dim]
 
+    # Overwirte the method to temporaily soppurt jit scriptable in Transformer
+    @torch.jit.export
+    def reorder_incremental_state(
+        self,
+        incremental_state: Dict[str, Dict[str, Optional[Tensor]]],
+        new_order: Tensor,
+    ):
+        """Scriptable reorder incremental state in the transformer."""
+        for layer in self.layers:
+            layer.reorder_incremental_state(incremental_state, new_order)
+
     def upgrade_state_dict_named(self, state_dict, name):
         """Upgrade a (possibly old) state dict for new versions of fairseq."""
         if isinstance(self.embed_positions, SinusoidalPositionalEmbedding):
@@ -924,20 +920,6 @@ class TransformerDecoder(FairseqIncrementalDecoder):
             state_dict[
                 "{}.embed_positions._float_tensor".format(name)
             ] = torch.FloatTensor(1)
-
-        if self.share_input_output_embed:
-            embed_tokens_weight_key = f"{name}.embed_tokens.weight"
-            if embed_tokens_weight_key in state_dict:
-                state_dict[f"{name}.output_projection.weight"] = state_dict[
-                    embed_tokens_weight_key
-                ]
-        else:
-            embed_out_key = f"{name}.embed_out"
-            if embed_out_key in state_dict:
-                state_dict[f"{name}.output_projection.weight"] = state_dict[
-                    embed_out_key
-                ]
-                del state_dict[embed_out_key]
 
         for i in range(self.num_layers):
             # update layer norms

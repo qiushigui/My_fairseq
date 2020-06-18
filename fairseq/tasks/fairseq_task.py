@@ -206,10 +206,9 @@ class FairseqTask(object):
         Returns:
             a :class:`~fairseq.models.BaseFairseqModel` instance
         """
-        from fairseq import models, quantization_utils
+        from fairseq import models
 
-        model = models.build_model(args, self)
-        return quantization_utils.quantize_model_scalar(model, args)
+        return models.build_model(args, self)
 
     def build_criterion(self, args):
         """
@@ -226,7 +225,7 @@ class FairseqTask(object):
 
         return criterions.build_criterion(args, self)
 
-    def build_generator(self, models, args):
+    def build_generator(self, args):
         if getattr(args, "score_reference", False):
             from fairseq.sequence_scorer import SequenceScorer
 
@@ -296,7 +295,6 @@ class FairseqTask(object):
             seq_gen_cls = SequenceGenerator
 
         return seq_gen_cls(
-            models,
             self.target_dictionary,
             beam_size=getattr(args, "beam", 5),
             max_len_a=getattr(args, "max_len_a", 0),
